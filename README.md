@@ -10,88 +10,80 @@ The method can be used on both AlphaFold2 and AlphaFold3 (including server) outp
 
 
 ## Using the Colab notebook
-- [ ] Open the interactive Colab notebook [here](https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb) or click “Open in Colab” above
+- [ ] Open the interactive Colab notebook [here](https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb) or click "Open in Colab" above
 - [ ] Run the first cell (▶) to enable file upload
 - [ ] Upload the required files: 1) a structure file (PDB or CIF) and 2) its matching JSON file with the PAE matrix
 - [ ] Execute subsequent cells step by step (▶)
 - [ ] Download the results as a zipped folder from the final cell
 
 
-## Command-line usage (R script)
-To run Pinc locally, download the [`Pinc.R`](https://git.mpi-cbg.de/tothpetroczylab/Pinc/-/blob/main/Pinc.R) script from the repository, for example:
+## Command-line usage
+- [ ] Clone the repository and compile the program with `make` (requires `gcc` or `clang`, available on Linux, Mac, and Windows):
 
 ```bash
-wget https://git.mpi-cbg.de/tothpetroczylab/Pinc/-/blob/main/Pinc.R
-```
-
-- [ ] Ensure that R (≥ 3.5.0) is installed. Installation instructions are available on CRAN: https://cran.r-project.org/
-- [ ] The script requires the jsonlite package. If it is not installed, you can install it from the command line:
-
-```bash
-Rscript -e "install.packages('jsonlite', repos = 'https://cloud.r-project.org')"
+git clone https://git.mpi-cbg.de/tothpetroczylab/Pinc.git
+cd Pinc
+make
 ```
 
 
 ## Getting started
-Calling the `R` script empty will display the script's usage information:
+Calling the program empty will display its usage information:
 
 ```bash
-Rscript Pinc.R
+./Pinc
 ```
 
 ```txt
 Description:
-     R script to compute the Pinc score from an AlphaFold PAE
-     matrix (JSON) and the corresponding structure file (PDB/CIF).
+   A program to compute the Pinc score from an AlphaFold PAE
+   matrix (JSON) and the corresponding structure file (PDB/CIF).
 
- Usage:
-     Rscript Pinc.R <json_file> <structure_file> [options]
+Usage:
+   Pinc <json_file> <structure_file> [options]
 
- Options:
-     None        Pinc score for all unique chain pairs (default)
-     --all       Full contact probability matrix
-     --pairlist  Residue pair list of non-zero contact probabilities
-     --results   Optional path to output folder
+Options:
+   None        Pinc score for all unique chain pairs (default)
+   --all       Full contact probability matrix
+   --pairlist  Residue pair list of non-zero contact probabilities
+   --results   Optional path to output folder
 
- Example:
-     Rscript Pinc.R model_0.json model_0.cif --all --results /usr/home/pinc
-
- Output format:
-     - default: <structure_file_name>_Pinc.csv
-     - all: <structure_file_name>_contact_probability.json
-     - pairlist: <structure_file_name>_pairlist.csv
+Output format:
+   - default:  <structure_file_name>_Pinc.csv
+   - all:      <structure_file_name>_contact_probability.json
+   - pairlist: <structure_file_name>_pairlist.csv
 ```
 
 
 ## Usage
 The `test` directory contains example input files you can use to test the below functionalities.
 
-**1**) Assuming you have a structure file `model_0.cif` and an associated JSON data file `model_0.json` with the PAE matrix, to calculate Pinc scores for all chain pairs you can call the script simply by:
+**1**) Assuming you have a structure file `model_0.cif` and an associated JSON data file `model_0.json` with the PAE matrix, to calculate Pinc scores for all chain pairs you can call the program simply by:
 
 ```
-Rscript Pinc.R model_0.json model_0.cif 
+./Pinc model_0.json model_0.cif
 ```
 
-The script will generate a `model_0_Pinc.csv` file with columns `chain1`, `chain2`, and `Pinc`, where chain pairs are non-redundant (for A-B there is no B-A).
+The program will generate a `model_0_Pinc.csv` file with columns `chain1`, `chain2`, and `Pinc`, where chain pairs are non-redundant (for A-B there is no B-A).
 
 
 **2**) If you need the full contact probability matrix, add the `--all` flag:
 
 ```
-Rscript Pinc.R model_0.json model_0.cif --all
+./Pinc model_0.json model_0.cif --all
 ```
 
-The script will additionally generate a `model_0_contact_probability.json` file with node names `token_chain_ids` and `contact_probability`, similar to the AlphaFold3 output.
+The program will additionally generate a `model_0_contact_probability.json` file with node names `token_chain_ids` and `contact_probability`, similar to the AlphaFold3 output.
 Note that `token_chain_ids` define the shape of the square matrix that can be reconstructed from the numeric array. 
 
 
 **3**) If you need a list of all non-zero probabilities at the token-level, call:
 
 ```
-Rscript Pinc.R model_0.json model_0.cif --pairlist
+./Pinc model_0.json model_0.cif --pairlist
 ```
 
-The script will additionally generate a `model_0_pairlist.csv` file with columns `token1`, `token2`, `contact_p`, and `distance` columns.
+The program will additionally generate a `model_0_pairlist.csv` file with columns `token1`, `token2`, `contact_p`, and `distance` columns.
 The tokens essentially represent residues for proteins and bases for nucleic acids, but can also stand for atoms in ligands or ions.
 The pair list is non-redundant (for A-B there is no B-A), and represent the mean of the two contacts (A->B and B->A).
 The distance is the centre-of-mass distance between the tokens in Ångströms.
@@ -103,10 +95,18 @@ Note that `--all` and `--pairlist` flags _can_ be used together.
 **4**) If you would like to specify a results folder, use:
 
 ```
-Rscript Pinc.R model_0_full_data.json model_0.cif --results /usr/home/path_to_pinc_folder
+./Pinc model_0_full_data.json model_0.cif --results /usr/home/path_to_pinc_folder
 ```
 
 **Important**: Make sure the directory has write access.
+
+
+## Legacy R script
+The original R implementation ([`Pinc.R`](https://git.mpi-cbg.de/tothpetroczylab/Pinc/-/blob/main/Pinc.R)) is retained in the repository for reference, as it is the version described in the preprint. It requires R (≥ 3.5.0) and the `jsonlite` package. Usage is identical to the C version, substituting `Rscript Pinc.R` for `./Pinc`:
+
+```bash
+Rscript Pinc.R model_0.json model_0.cif
+```
 
 
 ## Contact
@@ -123,4 +123,3 @@ Please report any technical problems and questions via [Issues](https://git.mpi-
   publisher={Cold Spring Harbor Laboratory}
 }
 ```
-
