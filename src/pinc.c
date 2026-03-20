@@ -5,7 +5,6 @@
  * and the corresponding structure file (PDB/CIF).
  *
  * git: https://git.mpi-cbg.de/tothpetroczylab/Pinc
- * contact: <badonyi@mpi-cbg.de
  */
 
 #include <stdio.h>
@@ -585,9 +584,7 @@ ParsedStruct parse_structure(const char *str_file) {
                 cid = num_uchains++;
             }
 
-            // hot-path optimisation: consecutive atoms in well-ordered structure
-            // files almost always belong to the same residue, so check the last
-            // entry before falling through to the hash table
+            // check the last entry before falling through to the hash table
             int ri = -1;
             if (count > 0 && strcmp(res_arr[count - 1].token, token) == 0) {
                 ri = count - 1;
@@ -596,7 +593,7 @@ ParsedStruct parse_structure(const char *str_file) {
             }
 
             if (ri == -1) {
-                // early guard: fail before allocating downstream matrices
+                // fail before allocating downstream matrices
                 if (count >= MAX_TOKENS) {
                     fclose(f);
                     free(dot_counters);
@@ -744,9 +741,7 @@ int main(int argc, char **argv) {
     double *cont_sym = malloc(sym_size * sizeof(double));
     if (!dist_mat || !cont_sym) fail("Symmetric matrix allocation failed.");
 
-    // compute distances and symmetric contact probabilities;
-    // the asymmetric contact matrix for --all output is built in a separate
-    // isolated block below, keeping the conditional allocation self-contained
+    // compute distances and symmetric contact probabilities
     for (size_t i = 0; i < (size_t)n_res; i++) {
         size_t diag_idx = PACKED_IDX(i, i, n_res);
         dist_mat[diag_idx] = 0.0;
@@ -785,7 +780,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // build chain index: single flat array with offset/count per chain
+    // chain index: single flat array with offset/count per chain
     ChainResIndex ci = build_chain_index(res, n_res, num_uchains);
 
     size_t total_pairs = ((size_t)num_uchains * ((size_t)num_uchains - 1)) / 2;
@@ -835,8 +830,7 @@ int main(int argc, char **argv) {
         fclose(fp);
     } else fprintf(stderr, "warning: could not write %s\n", pinc_csv);
 
-    // --all output: self-contained block that allocates, computes, writes,
-    // and frees the full asymmetric contact matrix independently
+    // optional --all output
     if (opt_all) {
         double *cont_asym = malloc((size_t)n_res * (size_t)n_res * sizeof(double));
         if (!cont_asym) fail("Full contact matrix allocation failed.");
@@ -895,7 +889,7 @@ int main(int argc, char **argv) {
         free(cont_asym);
     }
 
-    // --pairlist output: uses chain index for targeted inter-chain iteration
+    // optional --pairlist output
     if (opt_pairlist) {
         int cap = 1000, pcnt = 0;
         TokenPair *tpairs = malloc(cap * sizeof(TokenPair));
