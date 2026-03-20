@@ -5,14 +5,14 @@
 <!-- badges: end -->
 
 ## Description
-Pinc (probability of interface native contacts) is a simple-to-calculate protein–protein interaction confidence metric derived from AlphaFold model coordinates and the associated predicted aligned error (PAE) matrix. It provides an interpretable probabilistic estimate of interface reliability. For example, a Pinc score of 0.8 can be read as predicting that approximately 80% of the interfacial contacts observed in the native structure are present in the model.
+Pinc (**P**robability of **i**nterface **n**ative **c**ontacts) is a simple-to-calculate protein–protein interaction confidence metric derived from AlphaFold model coordinates and the associated predicted aligned error (PAE) matrix. It provides an interpretable probabilistic estimate of interface reliability. For example, a Pinc score of 0.8 can be read as predicting that approximately 80% of the interfacial contacts observed in the native structure are present in the model.
 The method can be used on both AlphaFold2 and AlphaFold3 (including server) outputs.
 
 
 ## Using the Colab notebook
 - [ ] Open the interactive Colab notebook [here](https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb) or click "Open in Colab" above
 - [ ] Run the first cell (▶) to enable file upload
-- [ ] Upload the required files: 1) a structure file (PDB or CIF) and 2) its matching JSON file with the PAE matrix
+- [ ] Upload the required files: **1**) a structure file (PDB or CIF) and **2**) its matching JSON file with the PAE matrix
 - [ ] Execute subsequent cells step by step (▶)
 - [ ] Download the results as a zipped folder from the final cell
 
