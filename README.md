@@ -12,7 +12,7 @@ The method can be used on both AlphaFold2 and AlphaFold3 (including server) outp
 ## Using the Colab notebook
 - [ ] Open the interactive Colab notebook [here](https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb) or click "Open in Colab" above
 - [ ] Run the first cell (▶) to enable file upload
-- [ ] Upload the required files: **1**) a structure file (PDB or CIF) and **2**) its matching JSON file with the PAE matrix
+- [ ] Upload the required files: **1**) a structure file (PDB/CIF) and **2**) its matching PAE matrix (JSON)
 - [ ] Execute subsequent cells step by step (▶)
 - [ ] Download the results as a zipped folder from the final cell
 
