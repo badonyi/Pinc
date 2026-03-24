@@ -26,22 +26,19 @@ parse_command_args <- function() {
   if (length(args) < 2) {
     cat(
       'Description:\n',
-      '    R script to compute the Pinc score from an AlphaFold PAE\n',
-      '    matrix (JSON) and the corresponding structure file (PDB/CIF).\n\n',
+      '   R script to compute the Pinc score from an AlphaFold PAE\n',
+      '   matrix (JSON) and the corresponding structure file (PDB/CIF).\n\n',
       'Usage:\n',
-      '    Rscript Pinc.R <json_file> <structure_file> [options]\n\n',
+      '   Rscript Pinc.R <json_file> <structure_file> [options]\n\n',
       'Options:\n',
-      '    None        Pinc score for all unique chain pairs (default)\n',
-      '    --all       Full contact probability matrix\n',
-      '    --pairlist  Residue pair list of non-zero contact probabilities\n',
-      '    --results   Optional path to output folder\n\n',
-      'Example:\n',
-      '    Rscript Pinc.R model_0.json model_0.cif --all',
-      '--results /usr/home/pinc\n\n',
+      '   None        Pinc score for all unique chain pairs (default)\n',
+      '   --all       Full contact probability matrix\n',
+      '   --pairlist  Residue pair list of non-zero contact probabilities\n',
+      '   --results   Optional path to output folder\n\n',
       'Output format:\n',
-      '    - default: <structure_file_name>_Pinc.csv\n',
-      '    - all: <structure_file_name>_contact_probability.json\n',
-      '    - pairlist: <structure_file_name>_pairlist.csv\n\n'
+      '   - default:  <structure_file_name>_Pinc.csv\n',
+      '   - all:      <structure_file_name>_contact_probability.json\n',
+      '   - pairlist: <structure_file_name>_pairlist.csv\n\n'
     )
     exit()
   }
@@ -437,8 +434,8 @@ if (!identical(dim(dist_mat), dim(pae_mat))) {
     'Distance matrix dimensions: ',
     paste(dim(dist_mat), collapse = ' x '),
     '\n',
-    'Contact matrix dimensions: ',
-    paste(dim(cont_mat), collapse = ' x '),
+    'PAE matrix dimensions: ',
+    paste(dim(pae_mat), collapse = ' x '),
     '\n',
     'Check that the structure file and PAE matrix correspond to the same model.\n'
   )
