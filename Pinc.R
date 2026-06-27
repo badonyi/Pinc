@@ -13,11 +13,11 @@ parse_command_args <- function() {
   #
   # Returns:
   #   A named list with elements:
-  #     - jsn_file: path to AlphaFold JSON file
+  #     - jsn_file: path to AlphaFold PAE matrix (JSON)
   #     - str_file: path to AlphaFold structure file (PDB/mmCIF)
   #     - usr_opt: character vector of user-defined output options
   #         always includes 'default', may also include 'all' and 'pairlist'
-  #     - out_path: output file root name (derived from structure file),
+  #     - out_path: output file root name derived from structure file,
   #         prefixed with results folder if provided
 
   exit <- function() quit(status = 1, save = 'no')
@@ -140,7 +140,7 @@ parse_pae <- function(jsn_file) {
   #   jsn_file (character): path to JSON file containing PAE matrix
   #
   # Returns:
-  #   A numeric matrix of pairwise aligned errors.
+  #   An n x n matrix.
 
   jsn <- jsonlite::fromJSON(jsn_file)
 
@@ -159,7 +159,7 @@ parse_pae <- function(jsn_file) {
 }
 
 reduce_to_com <- function(coords) {
-  # Reduce atomic coordinates to residue centres of mass.
+  # Collapse atomic coordinates to residue centres of mass.
   #
   # Args:
   #   coords (data.frame): structure data with columns:
@@ -169,15 +169,14 @@ reduce_to_com <- function(coords) {
   #     - x, y, z: coordinates
   #
   # Returns:
-  #   A data.frame of residue centres of mass.
+  #   A data.frame of residue centre of mass coordinates.
 
   xyz <- c('x', 'y', 'z')
   coords$m <- c(
     'S' = 32.0650,
     'P' = 30.9738,
     'O' = 15.9994,
-    'N' = 14.0067,
-    'C' = 12.0107
+    'N' = 14.0067
   )[coords$e]
   coords$m[is.na(coords$m)] <- 12.0107 # assume carbon
 
@@ -189,23 +188,22 @@ reduce_to_com <- function(coords) {
   com <- aggregate(coords[, xyz] * coords$m, by = list(grp), FUN = sum)
   com[, xyz] <- com[, xyz] / tapply(coords$m, grp, sum)
 
-  return(com)
+  com
 }
 
 str_to_dist <- function(str_file) {
   # Parse a PDB/mmCIF file as a centre of mass distance matrix.
   #
   # Args:
-  #   file (character): path to structure file
+  #   str_file (character): path to structure file
   #
   # Returns:
-  #   An n x n matrix where n is the number of residues
-  #   in the structure. Column & row names are chain IDs.
+  #   An n x n matrix. Column & row names are chain IDs.
 
   lines <- readLines(str_file, warn = FALSE)
   atom_idx <- grep('^ATOM|^HETATM', lines)
 
-  if (length(atom_idx) < 10) { 
+  if (length(atom_idx) < 10) {
     stop('Non-structure file or insufficient number of ATOM records.')
   }
 
@@ -223,7 +221,9 @@ str_to_dist <- function(str_file) {
     )
 
     keep <- records %in% header
-    coords <- read.table(textConnection(lines[atom_idx]), na.strings = NULL)[keep]
+    coords <- read.table(textConnection(lines[atom_idx]), na.strings = NULL)[
+      keep
+    ]
     colnames(coords) <- names(header)[match(records[keep], header)]
 
     # consecutive IDs for '.' placeholder in non-polymer entities
@@ -251,12 +251,12 @@ str_to_dist <- function(str_file) {
   com <- reduce_to_com(coords[coords$e != 'H', ])
   dist_mat <- as.matrix(dist(com[c('x', 'y', 'z')], upper = TRUE))
 
-  # important: chain for columns chain_tokenID for rows
-  # inherited by cont_mat and used in contact_pairlist()
+  # important: chain for columns, chain_tokenID for rows;
+  # inherited by cont_asym and used in contact_pairlist()
   colnames(dist_mat) <- sub('_.*$', '', com[, 1])
   rownames(dist_mat) <- com[, 1]
 
-  return(dist_mat)
+  dist_mat
 }
 
 pae_to_prob <- function(pae_mat, dist_mat) {
@@ -264,15 +264,16 @@ pae_to_prob <- function(pae_mat, dist_mat) {
   #
   # Args:
   #   pae_mat (matrix): pairwise aligned error matrix
-  #   dist_mat (matrix): distance matrix
+  #   dist_mat (matrix): residue distance matrix
   #
   # Returns:
-  #   A numeric matrix of same dimensions with contact probabilities.
+  #   An n x n matrix.
 
   # sphere volume helper
   vol_sphere <- function(r) (4 / 3) * pi * (r^3)
 
-  # sphere-sphere intersection volume (radii Rc, Ru; D distance apart)
+  # sphere-sphere intersection volume (fixed reference sphere radius Rc,
+  # uncertainty sphere radius Ru, centroid distance D)
   vol_intersect <- function(Ru, D) {
     vol_vec <- numeric(length(Ru))
     ok <- is.finite(Ru) & is.finite(D) & (Ru > 0)
@@ -286,17 +287,17 @@ pae_to_prob <- function(pae_mat, dist_mat) {
     dd <- D[ok]
     vol <- numeric(length(dd))
 
-    # if disjoint, volume is zero
+    # if disjoint, volume is zero (already initialised to zero)
     disjoint <- dd >= (rc + ru)
 
-    # if containment, intersection is the volume of the smaller sphere
+    # if one sphere fully contains the other, intersection is the smaller volume
     contain <- dd <= abs(rc - ru)
     if (any(contain)) {
       contain[is.na(contain)] <- FALSE
       vol[contain] <- vol_sphere(pmin(rc, ru[contain]))
     }
 
-    # otherwise solve analitically
+    # otherwise compute the standard lens formula analytically
     other <- !(contain | disjoint)
     if (any(other)) {
       other[is.na(other)] <- FALSE
@@ -317,39 +318,36 @@ pae_to_prob <- function(pae_mat, dist_mat) {
 
   # flatten for vectorisation
   n <- nrow(pae_mat)
-  unc_radii <- as.numeric(t(pae_mat))
+  unc_ij <- as.numeric(t(pae_mat))
+
   dist_vec <- as.numeric(t(dist_mat))
+  vol_unc_ij <- vol_sphere(unc_ij)
 
-  # compute volumes
-  vol_int <- vol_intersect(Ru = unc_radii, D = dist_vec)
-  vol_unc <- vol_sphere(unc_radii)
+  # raw contact probabilities
+  p_ij <- vol_intersect(unc_ij, dist_vec) / vol_unc_ij
 
-  # contact probability with numerical bounds
-  prob_vec <- vol_int / vol_unc
-  prob_vec[!is.finite(prob_vec)] <- 0
-  prob_vec <- pmax(0, pmin(1, prob_vec))
+  # clamp to [0, 1] and guard against non-finite values
+  p_ij[!is.finite(p_ij)] <- 0
+  p_ij <- pmax(0, pmin(1, p_ij))
 
-  # convert back to matrix
-  cont_mat <- t(matrix(prob_vec, nrow = n, ncol = n))
-  diag(cont_mat) <- 1
-  colnames(cont_mat) <- colnames(dist_mat)
-  rownames(cont_mat) <- rownames(dist_mat)
+  # asymmetric matrix: row i, col j holds p(i->j); p(j->i) is the transpose
+  cont_asym <- t(matrix(p_ij, nrow = n, ncol = n))
+  diag(cont_asym) <- 1
+  colnames(cont_asym) <- colnames(dist_mat)
+  rownames(cont_asym) <- rownames(dist_mat)
 
-  return(cont_mat)
+  cont_asym
 }
 
-compute_pinc <- function(cont_mat, dist_mat) {
+compute_pinc <- function(cont_asym, dist_mat) {
   # Compute the Pinc score between all non-redundant chain pairs.
   #
   # Args:
-  #   cont_mat (matrix): contact probability matrix
+  #   cont_asym (matrix): asymmetric contact probability matrix
   #   dist_mat (matrix): residue distance matrix
   #
   # Returns:
-  #   A data frame with Pinc scores for each unique chain pair.
-
-  # average probabilities for i-j and j-i pairs
-  cm <- (cont_mat + t(cont_mat)) / 2
+  #   A data frame with columns chain1, chain2, Pinc1, Pinc2, Pinc.
 
   # list of chain indices for pairwise comparison
   chains <- colnames(dist_mat)
@@ -359,62 +357,66 @@ compute_pinc <- function(cont_mat, dist_mat) {
 
   # unique chain pair combinations
   pairs <- t(combn(uchain, 2))
-  pinc <- numeric(nrow(pairs))
+  pinc1 <- numeric(nrow(pairs))
+  pinc2 <- numeric(nrow(pairs))
 
-  # iterate over chain pairs and compute Pinc score
-  for (k in 1:nrow(pairs)) {
+  for (k in seq_len(nrow(pairs))) {
     i <- idx[[pairs[k, 1]]]
     j <- idx[[pairs[k, 2]]]
 
-    dvec <- dist_mat[i, j]
+    dvec <- dist_mat[i, j, drop = FALSE]
     keep <- is.finite(dvec) & (dvec < CONTACT_RADIUS)
 
     if (any(keep)) {
-      pinc[k] <- mean(cm[i, j][keep])
-    } else {
-      pinc[k] <- 0
+      # Pinc1: chain1 residues carry the uncertainty sphere -> use cont_asym[j, i]
+      # Pinc2: chain2 residues carry the uncertainty sphere -> use cont_asym[i, j]
+      pinc1[k] <- mean(cont_asym[j, i][t(keep)])
+      pinc2[k] <- mean(cont_asym[i, j][keep])
     }
   }
 
   pinc_df <- data.frame(
     chain1 = pairs[, 1],
     chain2 = pairs[, 2],
-    Pinc = round(pinc, 4)
+    Pinc1 = sprintf('%.4f', pinc1),
+    Pinc2 = sprintf('%.4f', pinc2),
+    Pinc = sprintf('%.4f', (pinc1 + pinc2) / 2)
   )
 
-  # sort by Pinc score
+  # sort by Pinc score descending
   pinc_df[order(pinc_df$Pinc, decreasing = TRUE), ]
 }
 
-contact_pairlist <- function(cont_mat, dist_mat) {
+contact_pairlist <- function(cont_asym, dist_mat) {
   # Generate a list of contacting token pairs with their probabilities.
   #
   # Args:
-  #   cont_mat (matrix): contact probability matrix
+  #   cont_asym (matrix): asymmetric contact probability matrix
   #   dist_mat (matrix): token distance matrix
   #
   # Returns:
-  #   A data frame with columns: token1, token2, p_contact, dist
+  #   A data frame with columns: token1, token2, contact_p, distance,
+  #   sorted by contact_p descending.
 
-  # average probabilities for i-j and j-i pairs
-  cm <- (cont_mat + t(cont_mat)) / 2
+  # symmetrise
+  cont_sym <- (cont_asym + t(cont_asym)) / 2
 
-  # non-zero interchain probabilities
-  keep <- upper.tri(cm, diag = FALSE) &
-    (cm > 0) &
+  # non-zero interchain contacts in the upper triangle
+  keep <- upper.tri(cont_sym, diag = FALSE) &
+    (cont_sym > 0) &
     (dist_mat < CONTACT_RADIUS) &
-    (colnames(cm)[row(cm)] != colnames(cm)[col(cm)])
+    (colnames(cont_sym)[row(cont_sym)] != colnames(cont_sym)[col(cont_sym)])
 
   # long format pair representation
   ij <- which(keep, arr.ind = TRUE)
   pair_df <- data.frame(
-    token1 = rownames(cm)[ij[, 1]],
-    token2 = rownames(cm)[ij[, 2]],
-    contact_p = round(cm[keep], 4),
-    distance = round(dist_mat[keep], 4)
+    token1 = rownames(cont_sym)[ij[, 1]],
+    token2 = rownames(cont_sym)[ij[, 2]],
+    contact_p = sprintf('%.4f', cont_sym[keep]),
+    distance = sprintf('%.4f', dist_mat[keep])
   )
 
-  # sort by contact probability
+  # sort by contact probability descending
   pair_df[order(pair_df$contact_p, decreasing = TRUE), ]
 }
 
@@ -427,7 +429,7 @@ pae_mat <- parse_pae(args$jsn_file)
 # parse the distance matrix from the structure file
 dist_mat <- str_to_dist(args$str_file)
 
-# check for shape mismatch
+# check for shape mismatch between PAE and distance matrices
 if (!identical(dim(dist_mat), dim(pae_mat))) {
   stop(
     'Dimension mismatch between distance and contact matrices.\n',
@@ -442,22 +444,22 @@ if (!identical(dim(dist_mat), dim(pae_mat))) {
 }
 
 # convert PAE to contact probabilities
-cont_mat <- pae_to_prob(pae_mat, dist_mat)
+cont_asym <- pae_to_prob(pae_mat, dist_mat)
 
-# compute and write Pinc scores
+# compute and write Pinc scores (default; always produced)
 write.csv(
-  x = compute_pinc(cont_mat, dist_mat),
+  x = compute_pinc(cont_asym, dist_mat),
   file = paste0(args$out_path, '_Pinc.csv'),
   row.names = FALSE,
   quote = FALSE
 )
 
-# write contact probability matrix if requested
+# write full asymmetric contact probability matrix if requested
 if ('all' %in% args$usr_opt) {
   jsonlite::write_json(
     x = list(
-      token_chain_ids = colnames(cont_mat),
-      contact_probability = cont_mat
+      token_chain_ids = colnames(cont_asym),
+      contact_probability = cont_asym
     ),
     path = paste0(args$out_path, '_contact_probability.json'),
     digits = 4,
@@ -465,10 +467,10 @@ if ('all' %in% args$usr_opt) {
   )
 }
 
-# write contact pair list if requested
+# write residue-pair contact list if requested
 if ('pairlist' %in% args$usr_opt) {
   write.csv(
-    x = contact_pairlist(cont_mat, dist_mat),
+    x = contact_pairlist(cont_asym, dist_mat),
     file = paste0(args$out_path, '_pairlist.csv'),
     row.names = FALSE,
     quote = FALSE
