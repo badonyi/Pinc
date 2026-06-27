@@ -1,6 +1,6 @@
 /**
  * Pinc - a simple probabilistic AlphaFold interaction score
- * 
+ *
  * Computes Pinc score from an AlphaFold PAE matrix (JSON)
  * and the corresponding structure file (PDB/CIF).
  *
@@ -42,6 +42,7 @@
 #endif
 
 // packed 1D index for a symmetric NxN upper-triangular matrix
+// caller must guarantee i <= j; debug builds assert this, release (NDEBUG) builds trust it
 #ifdef NDEBUG
 #define PACKED_IDX(i, j, n) \
     ((size_t)(i) * (size_t)(n) - ((size_t)(i) * ((size_t)(i) + 1)) / 2 + (size_t)(j))
@@ -51,46 +52,78 @@
      (size_t)(i) * (size_t)(n) - ((size_t)(i) * ((size_t)(i) + 1)) / 2 + (size_t)(j))
 #endif
 
+// safe for i/j in either order; swaps them before delegating to PACKED_IDX
 #define SYM_IDX(i, j, n) ((i) <= (j) ? PACKED_IDX(i, j, n) : PACKED_IDX(j, i, n))
 
 /* -------------------------------------------------------------------------- */
 /* Data structures                                                            */
 /* -------------------------------------------------------------------------- */
+
+// string and identifier metadata for one residue; kept separate from coordinates
+// (Structure-of-Arrays layout) so the hot O(n^2) distance loop reads only dense
+// coordinate data and stays cache-friendly and auto-vectorizable
 typedef struct {
     char chain[MAX_CHAIN_LEN];
     char seq_id[MAX_SEQ_LEN];
     char token[MAX_CHAIN_LEN + MAX_SEQ_LEN + 1];
     int chain_id;
-    double x, y, z, mass_sum; 
-} Residue;
+} ResidueMeta;
 
 typedef char ChainName[MAX_CHAIN_LEN];
 
+// per-atom coordinates tagged with their owning residue index; collected while
+// parsing but never consumed elsewhere beyond being freed
+typedef struct { int res_idx; double x, y, z; } RawAtom;
+
+// parsed residues in Structure-of-Arrays form: meta and the x/y/z coordinates live
+// in separate parallel flat arrays (see ResidueMeta above for the rationale)
 typedef struct {
-    Residue *res_arr;
+    ResidueMeta *meta;
+    double *x;
+    double *y;
+    double *z;
     int res_count;
     ChainName *uchains;
     int num_uchains;
+    RawAtom *atoms;
+    int atom_count;
 } ParsedStruct;
 
+// aggregated score for one unique pair of chains; pinc1/pinc2 are the mean contact
+// probability viewed from each chain's own (asymmetric) PAE column, pinc_score is
+// their average and the symmetric Pinc score reported by default.
+// order records the pair's generation index so the descending sort breaks ties stably
 typedef struct {
     char chain1[MAX_CHAIN_LEN];
     char chain2[MAX_CHAIN_LEN];
+    double pinc1;
+    double pinc2;
     double pinc_score;
+    int order;
 } ChainPair;
 
+// one row of the --pairlist output: a single (already symmetrized, see cont_sym)
+// residue-residue contact together with its centroid-to-centroid distance.
+// lo/hi are the residue indices (lo < hi); they let the descending sort break ties in
+// the same column-major upper-triangle order the R reference emits for equal probabilities
 typedef struct {
     char token1[MAX_CHAIN_LEN + MAX_SEQ_LEN + 1];
     char token2[MAX_CHAIN_LEN + MAX_SEQ_LEN + 1];
     double contact_p;
     double distance;
+    int lo;
+    int hi;
 } TokenPair;
 
+// per-chain running counter used to invent sequential seq_ids for mmCIF residues
+// whose label_seq_id is "." (typically heteroatoms/waters with no canonical numbering)
 typedef struct {
     char name[MAX_CHAIN_LEN];
     int count;
 } ChainDotCounter;
 
+// CSR-style grouping of residue indices by chain: indices belonging to chain c live
+// in flat[offsets[c] .. offsets[c]+counts[c]-1]
 typedef struct {
     int *flat;
     int *offsets;
@@ -98,6 +131,9 @@ typedef struct {
     int num_chains;
 } ChainResIndex;
 
+// open-addressing hash table (linear probing) mapping a residue token string to its
+// index in the metadata array; capacity is always a power of two so '& (capacity-1)'
+// replaces the modulo operation, and empty slots are marked with -1
 typedef struct {
     int *res_indices;
     int capacity;
@@ -132,7 +168,9 @@ char *trim_in_place(char *str) {
     return str;
 }
 
-// thread-safe tokenization
+// thread-safe tokenization that collapses runs of delimiters, so consecutive
+// whitespace never yields empty tokens; fine for mmCIF's whitespace-separated
+// columns, but would swallow a genuinely empty field
 char *safe_strtok_r(char *str, const char *delim, char **saveptr) {
     if (!str) str = *saveptr;
     if (!str) return NULL;
@@ -154,6 +192,7 @@ char *safe_strtok_r(char *str, const char *delim, char **saveptr) {
 }
 
 // robust double parsing wrapper around strtod
+// returns false (rather than 0.0) when no characters were consumed, e.g. blank fields
 bool safe_parse_double(const char *str, double *val) {
     if (!str || !*str) return false;
     char *end;
@@ -161,7 +200,6 @@ bool safe_parse_double(const char *str, double *val) {
     return (end != str);
 }
 
-// check extension
 bool has_extension(const char *file, const char *ext1, const char *ext2) {
     const char *dot = strrchr(file, '.');
     if (!dot) return false;
@@ -171,7 +209,8 @@ bool has_extension(const char *file, const char *ext1, const char *ext2) {
     return false;
 }
 
-// assign atomic masses based on element symbol
+// atomic mass by element symbol; anything not S/P/O/N (hydrogen included)
+// falls back to carbon's mass
 double get_mass(const char *elem) {
     if (strcasecmp(elem, "S") == 0) return 32.0650;
     if (strcasecmp(elem, "P") == 0) return 30.9738;
@@ -180,7 +219,6 @@ double get_mass(const char *elem) {
     return 12.0107;
 }
 
-// sphere volume helper
 double vol_sphere(double r) {
     return (4.0 / 3.0) * M_PI * (r * r * r);
 }
@@ -189,13 +227,27 @@ double vol_sphere(double r) {
 double vol_intersect(double Ru, double D) {
     double rc = CONTACT_RADIUS;
     if (!isfinite(Ru) || !isfinite(D) || Ru <= 0.0) return 0.0;
+    // spheres are too far apart to overlap at all
     if (D >= (rc + Ru)) return 0.0;
+    // one sphere fully contains the other; intersection is just the smaller sphere's volume
     if (D <= fabs(rc - Ru)) return vol_sphere(fmin(rc, Ru));
 
+    // standard closed-form volume of the lens formed by two partially overlapping spheres
     double t1 = rc + Ru - D;
     double t2 = Ru - rc;
     double num = M_PI * (t1 * t1) * (D * D + 2.0 * D * (Ru + rc) - 3.0 * (t2 * t2));
     return fmax(0.0, num / (12.0 * D));
+}
+
+// contact probability from a single PAE value and centroid distance, clamped to [0,1];
+// factored out to avoid repeating the same guard/clamp pattern at every call site
+double contact_prob(double pae, double d) {
+    if (pae <= 0.0) return 0.0;
+    double v_unc = vol_sphere(pae);
+    if (v_unc <= 0.0) return 0.0;
+    double p = vol_intersect(pae, d) / v_unc;
+    if (!isfinite(p) || p < 0.0) return 0.0;
+    return (p > 1.0) ? 1.0 : p;
 }
 
 // FNV-1a hash for strings
@@ -208,38 +260,38 @@ uint32_t hash_str(const char *str) {
     return hash;
 }
 
-// initialize hash table
+// allocate a hash table; capacity is rounded up to the next power of two so lookups
+// can mask instead of modulo
 ResHash *rhash_create(int target_capacity) {
     ResHash *h = malloc(sizeof(ResHash));
     if (!h) fail("Hash table allocation failed.");
-    
+
     int p2_cap = 1;
     while (p2_cap < target_capacity) p2_cap <<= 1;
-    
+
     h->capacity = p2_cap;
     h->size = 0;
     h->res_indices = malloc(h->capacity * sizeof(int));
     if (!h->res_indices) fail("Hash indices allocation failed.");
-    
+
     for (int i = 0; i < h->capacity; i++) h->res_indices[i] = -1;
     return h;
 }
 
-// resize and rehash
-void rhash_resize(ResHash *h, Residue *res_arr) {
+void rhash_resize(ResHash *h, ResidueMeta *meta) {
     int old_cap = h->capacity;
     int *old_idx = h->res_indices;
 
     h->capacity *= 2;
     h->res_indices = malloc(h->capacity * sizeof(int));
     if (!h->res_indices) fail("Hash resize allocation failed.");
-    
+
     for (int i = 0; i < h->capacity; i++) h->res_indices[i] = -1;
 
     for (int i = 0; i < old_cap; i++) {
         if (old_idx[i] != -1) {
             int ri = old_idx[i];
-            uint32_t idx = hash_str(res_arr[ri].token) & (h->capacity - 1);
+            uint32_t idx = hash_str(meta[ri].token) & (h->capacity - 1);
             while (h->res_indices[idx] != -1) {
                 idx = (idx + 1) & (h->capacity - 1);
             }
@@ -249,24 +301,26 @@ void rhash_resize(ResHash *h, Residue *res_arr) {
     free(old_idx);
 }
 
-// retrieve residue index from hash table (-1 if not found)
-int rhash_get(ResHash *h, Residue *res_arr, const char *token) {
+// residue index for a token, or -1 if not found; linear probing walks forward
+// until the token matches or an empty (-1) slot is hit
+int rhash_get(ResHash *h, ResidueMeta *meta, const char *token) {
     if (h->size == 0) return -1;
     uint32_t idx = hash_str(token) & (h->capacity - 1);
     while (h->res_indices[idx] != -1) {
         int ri = h->res_indices[idx];
-        if (strcmp(res_arr[ri].token, token) == 0) return ri;
+        if (strcmp(meta[ri].token, token) == 0) return ri;
         idx = (idx + 1) & (h->capacity - 1);
     }
     return -1;
 }
 
-// insert residue index into hash table
-void rhash_insert(ResHash *h, Residue *res_arr, int ri) {
+// insert a residue index, resizing first if the load factor would exceed 50% so the
+// new entry is never written into a table that's about to be reallocated
+void rhash_insert(ResHash *h, ResidueMeta *meta, int ri) {
     if (h->size >= h->capacity / 2) {
-        rhash_resize(h, res_arr);
+        rhash_resize(h, meta);
     }
-    uint32_t idx = hash_str(res_arr[ri].token) & (h->capacity - 1);
+    uint32_t idx = hash_str(meta[ri].token) & (h->capacity - 1);
     while (h->res_indices[idx] != -1) {
         idx = (idx + 1) & (h->capacity - 1);
     }
@@ -274,14 +328,13 @@ void rhash_insert(ResHash *h, Residue *res_arr, int ri) {
     h->size++;
 }
 
-// free hash table
 void rhash_free(ResHash *h) {
     free(h->res_indices);
     free(h);
 }
 
 // build chain index: two-pass (count then fill) with a single flat array
-ChainResIndex build_chain_index(const Residue *res, int n_res, int num_uchains) {
+ChainResIndex build_chain_index(const ResidueMeta *meta, int n_res, int num_uchains) {
     ChainResIndex ci;
     ci.num_chains = num_uchains;
     ci.counts = calloc(num_uchains, sizeof(int));
@@ -290,7 +343,7 @@ ChainResIndex build_chain_index(const Residue *res, int n_res, int num_uchains) 
 
     // first pass: count residues per chain
     for (int i = 0; i < n_res; i++) {
-        ci.counts[res[i].chain_id]++;
+        ci.counts[meta[i].chain_id]++;
     }
 
     // compute offsets from counts
@@ -306,7 +359,7 @@ ChainResIndex build_chain_index(const Residue *res, int n_res, int num_uchains) 
     memcpy(write_pos, ci.offsets, num_uchains * sizeof(int));
 
     for (int i = 0; i < n_res; i++) {
-        int cid = res[i].chain_id;
+        int cid = meta[i].chain_id;
         ci.flat[write_pos[cid]++] = i;
     }
     free(write_pos);
@@ -314,28 +367,43 @@ ChainResIndex build_chain_index(const Residue *res, int n_res, int num_uchains) 
     return ci;
 }
 
-// free chain index
 void free_chain_index(ChainResIndex *ci) {
     free(ci->flat);
     free(ci->offsets);
     free(ci->counts);
 }
 
-// sorting helpers
+// sorting helpers (for consistency with R version)
 int cmp_chainpair(const void *a, const void *b) {
-    double diff = ((ChainPair *)b)->pinc_score - ((ChainPair *)a)->pinc_score;
-    return (diff > 0) - (diff < 0);
+    const ChainPair *pa = (const ChainPair *)a;
+    const ChainPair *pb = (const ChainPair *)b;
+    char sa[32], sb[32];
+    snprintf(sa, sizeof(sa), "%.4f", pa->pinc_score);
+    snprintf(sb, sizeof(sb), "%.4f", pb->pinc_score);
+    int c = strcmp(sb, sa);
+    if (c != 0) return c;
+    return (pa->order > pb->order) - (pa->order < pb->order);
 }
 
 int cmp_tokenpair(const void *a, const void *b) {
-    double diff = ((TokenPair *)b)->contact_p - ((TokenPair *)a)->contact_p;
-    return (diff > 0) - (diff < 0);
+    const TokenPair *pa = (const TokenPair *)a;
+    const TokenPair *pb = (const TokenPair *)b;
+    char sa[32], sb[32];
+    snprintf(sa, sizeof(sa), "%.4f", pa->contact_p);
+    snprintf(sb, sizeof(sb), "%.4f", pb->contact_p);
+    int c = strcmp(sb, sa);
+    if (c != 0) return c;
+    if (pa->hi != pb->hi) return (pa->hi > pb->hi) - (pa->hi < pb->hi);
+    return (pa->lo > pb->lo) - (pa->lo < pb->lo);
 }
 
 /* -------------------------------------------------------------------------- */
 /* File parsers                                                               */
 /* -------------------------------------------------------------------------- */
 
+// minimal hand-rolled scanner for AlphaFold's PAE output; it does not parse JSON
+// structurally, it just locates the PAE array and reads every numeric token inside,
+// using bracket-depth tracking only to find where that array ends
 double *parse_pae_json(const char *json_file, int *n_res) {
     FILE *f = fopen(json_file, "rb");
     if (!f) fail("could not open JSON file.");
@@ -350,6 +418,7 @@ double *parse_pae_json(const char *json_file, int *n_res) {
     buffer[fsize] = '\0';
     fclose(f);
 
+    // AlphaFold2/Multimer and AlphaFold3 use different key names for the same matrix
     char *ptr = strstr(buffer, "\"predicted_aligned_error\"");
     if (!ptr) ptr = strstr(buffer, "\"pae\"");
     if (!ptr) fail("no PAE matrix found in JSON.");
@@ -357,9 +426,13 @@ double *parse_pae_json(const char *json_file, int *n_res) {
     while (*ptr && *ptr != '[') ptr++;
     if (!*ptr) fail("malformed JSON: expected '[' after PAE key.");
 
+    // depth starts at 1 for the '[' just consumed and only returns to 0 at that same
+    // array's matching ']'; inner row brackets are tracked but otherwise ignored, so
+    // every number inside (regardless of nesting) lands in one flat buffer
     int depth = 1;
     ptr++;
 
+    // generous initial allocation, doubled via realloc below if it is exceeded
     size_t max_alloc = 1024 * 1024;
     double *pae = malloc(max_alloc * sizeof(double));
     if (!pae) {
@@ -396,18 +469,41 @@ double *parse_pae_json(const char *json_file, int *n_res) {
     }
     free(buffer);
 
+    // the PAE matrix is always n_res x n_res, so n_res can be recovered from the total
+    // element count; a non-square count means parsing went wrong or the file is malformed
     *n_res = (int)sqrt((double)count);
     if ((size_t)(*n_res) * (size_t)(*n_res) != count) fail("parsed PAE matrix is not perfectly square.");
     return pae;
 }
 
+// parses a PDB (fixed-column) or mmCIF (whitespace-delimited, columns taken from the
+// atom_site loop header) file into one row per residue, each residue's position set to
+// the mass-weighted centroid of its heavy (non-H) atoms.
+// the whole file is read into one bulk buffer to avoid per-line syscall overhead;
+// coordinates are stored in separate SoA flat arrays for cache efficiency
 ParsedStruct parse_structure(const char *str_file) {
-    FILE *f = fopen(str_file, "r");
+    FILE *f = fopen(str_file, "rb");
     if (!f) fail("could not open structure file.");
 
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *buffer = malloc(fsize + 1);
+    if (!buffer) fail("memory allocation failed for structure file buffer.");
+    if (fread(buffer, 1, fsize, f) != (size_t)fsize) fail("failed to read structure file.");
+    buffer[fsize] = '\0';
+    fclose(f);
+
     int cap = 1000;
-    Residue *res_arr = malloc(cap * sizeof(Residue));
-    if (!res_arr) fail("memory allocation failed for structure array.");
+    // SoA coordinate arrays, parallel to meta (see ResidueMeta for the rationale)
+    ResidueMeta *meta   = malloc(cap * sizeof(ResidueMeta));
+    double *res_x       = malloc(cap * sizeof(double));
+    double *res_y       = malloc(cap * sizeof(double));
+    double *res_z       = malloc(cap * sizeof(double));
+    double *mass_sum    = malloc(cap * sizeof(double));
+    if (!meta || !res_x || !res_y || !res_z || !mass_sum) fail("OOM for SoA structure arrays.");
+
     int count = 0;
 
     int uc_cap = 16;
@@ -417,32 +513,59 @@ ParsedStruct parse_structure(const char *str_file) {
 
     ResHash *rhash = rhash_create(4096);
 
-    char line[MAX_LINE];
+    int at_cap = 8192, at_cnt = 0;
+    RawAtom *atoms = malloc(at_cap * sizeof(RawAtom));
+    if (!atoms) fail("OOM atoms.");
+
     bool is_cif = false;
 
+    // c_* hold the column ordinal of each required mmCIF field, discovered from the
+    // atom_site loop header below; -1 means "not found yet"
     int c_chain = -1, c_seq = -1, c_elem = -1, c_x = -1, c_y = -1, c_z = -1;
     bool in_atom_site = false;
     bool cif_columns_validated = false;
     int cif_col_count = 0;
 
+    // tracks, per chain, how many '.' seq_ids have already been substituted (see below)
     int dc_cap = 16;
     ChainDotCounter *dot_counters = malloc(dc_cap * sizeof(ChainDotCounter));
     if (!dot_counters) fail("memory allocation failed for dot counters.");
     int num_chains_tracked = 0;
 
-    while (fgets(line, sizeof(line), f)) {
-        if (strchr(line, '\n') == NULL && !feof(f)) {
-            int ch;
-            while ((ch = fgetc(f)) != '\n' && ch != EOF);
+    char *ptr = buffer;
+    while (*ptr) {
+        // locate the end of the current line within the bulk buffer and null-terminate
+        // it in-place so downstream string functions see a normal C string; DOS-style
+        // CRLF is handled by also nulling the '\r' that precedes the '\n'
+        char *line_end = strchr(ptr, '\n');
+        if (line_end) {
+            *line_end = '\0';
+            if (line_end > ptr && *(line_end - 1) == '\r') {
+                *(line_end - 1) = '\0';
+            }
         }
 
+        char *line = ptr;
+
+        // presence of any _atom_site.* tag identifies the file as mmCIF and marks the
+        // start of its column-definition header
         if (strstr(line, "_atom_site.group_PDB")) {
             is_cif = true;
             in_atom_site = true;
         }
 
+        // each header line declares the next column in the data rows that follow, in
+        // order; record the ordinal of every field this program needs and let
+        // cif_col_count keep advancing for fields it does not care about.
+        // the line is copied to a stack buffer before trimming because line points into
+        // the bulk buffer and trim_in_place would corrupt subsequent lines if applied
+        // directly to it
         if (is_cif && in_atom_site && line[0] == '_') {
-            char *key = trim_in_place(line);
+            char key_buf[MAX_LINE];
+            strncpy(key_buf, line, sizeof(key_buf) - 1);
+            key_buf[sizeof(key_buf) - 1] = '\0';
+            char *key = trim_in_place(key_buf);
+
             if (strcmp(key, "_atom_site.label_asym_id") == 0) c_chain = cif_col_count;
             else if (strcmp(key, "_atom_site.label_seq_id") == 0) c_seq = cif_col_count;
             else if (strcmp(key, "_atom_site.type_symbol") == 0) c_elem = cif_col_count;
@@ -450,21 +573,20 @@ ParsedStruct parse_structure(const char *str_file) {
             else if (strcmp(key, "_atom_site.Cartn_y") == 0) c_y = cif_col_count;
             else if (strcmp(key, "_atom_site.Cartn_z") == 0) c_z = cif_col_count;
             cif_col_count++;
-            continue;
         }
-
-        if (strncmp(line, "ATOM", 4) == 0 || strncmp(line, "HETATM", 6) == 0) {
+        else if (strncmp(line, "ATOM", 4) == 0 || strncmp(line, "HETATM", 6) == 0) {
 
             // validate CIF columns once on the first ATOM/HETATM line;
             // fails early if any required _atom_site field is missing
             if (is_cif && !cif_columns_validated) {
                 if (c_chain < 0 || c_seq < 0 || c_elem < 0 ||
                     c_x < 0 || c_y < 0 || c_z < 0) {
-                    fclose(f);
+                    free(buffer);
+                    free(meta); free(res_x); free(res_y); free(res_z); free(mass_sum);
                     free(dot_counters);
                     rhash_free(rhash);
-                    free(res_arr);
                     free(uchains);
+                    free(atoms);
                     fail("CIF file missing required _atom_site columns "
                          "(need label_asym_id, label_seq_id, type_symbol, "
                          "Cartn_x, Cartn_y, Cartn_z).");
@@ -478,6 +600,8 @@ ParsedStruct parse_structure(const char *str_file) {
             double x = 0, y = 0, z = 0;
 
             if (is_cif) {
+                // safe_strtok_r mutates its input in place, so copy the line before
+                // tokenizing to avoid corrupting the bulk buffer for subsequent lines
                 char line_copy[MAX_LINE];
                 strncpy(line_copy, line, sizeof(line_copy) - 1);
                 line_copy[sizeof(line_copy) - 1] = '\0';
@@ -493,20 +617,23 @@ ParsedStruct parse_structure(const char *str_file) {
                 }
 
                 if (c_chain < t_count) {
-                    if ((size_t)snprintf(chain, sizeof(chain), "%s", tokens[c_chain]) >= sizeof(chain)) continue;
+                    if ((size_t)snprintf(chain, sizeof(chain), "%s", tokens[c_chain]) >= sizeof(chain)) goto next_line;
                 }
                 if (c_seq < t_count) {
-                    if ((size_t)snprintf(seq_id, sizeof(seq_id), "%s", tokens[c_seq]) >= sizeof(seq_id)) continue;
+                    if ((size_t)snprintf(seq_id, sizeof(seq_id), "%s", tokens[c_seq]) >= sizeof(seq_id)) goto next_line;
                 }
                 if (c_elem < t_count) strncpy(elem, tokens[c_elem], 3);
 
-                if (c_x < t_count && !safe_parse_double(tokens[c_x], &x)) continue;
-                if (c_y < t_count && !safe_parse_double(tokens[c_y], &y)) continue;
-                if (c_z < t_count && !safe_parse_double(tokens[c_z], &z)) continue;
+                if (c_x < t_count && !safe_parse_double(tokens[c_x], &x)) goto next_line;
+                if (c_y < t_count && !safe_parse_double(tokens[c_y], &y)) goto next_line;
+                if (c_z < t_count && !safe_parse_double(tokens[c_z], &z)) goto next_line;
 
             } else {
+                // fixed-width PDB columns (0-indexed here): chain at 21, seq number at
+                // 22-25, x/y/z at 30-37/38-45/46-53, element symbol at 76-77; a line
+                // shorter than 54 chars is skipped rather than read out of bounds
                 size_t len = strlen(line);
-                if (len < 54) continue;
+                if (len < 54) goto next_line;
 
                 chain[0] = line[21];
                 chain[1] = '\0';
@@ -519,15 +646,15 @@ ParsedStruct parse_structure(const char *str_file) {
 
                 memcpy(coord_buf, line + 30, 8);
                 coord_buf[8] = '\0';
-                if (!safe_parse_double(coord_buf, &x)) continue;
+                if (!safe_parse_double(coord_buf, &x)) goto next_line;
 
                 memcpy(coord_buf, line + 38, 8);
                 coord_buf[8] = '\0';
-                if (!safe_parse_double(coord_buf, &y)) continue;
+                if (!safe_parse_double(coord_buf, &y)) goto next_line;
 
                 memcpy(coord_buf, line + 46, 8);
                 coord_buf[8] = '\0';
-                if (!safe_parse_double(coord_buf, &z)) continue;
+                if (!safe_parse_double(coord_buf, &z)) goto next_line;
 
                 if (len >= 78) {
                     memcpy(elem, line + 76, 2);
@@ -538,8 +665,13 @@ ParsedStruct parse_structure(const char *str_file) {
 
             trim_in_place(chain);
             trim_in_place(elem);
-            if (strcasecmp(elem, "H") == 0) continue;
+            // hydrogens are excluded here because get_mass() has no entry for H and
+            // would otherwise silently weight it as carbon in the centroid below
+            if (strcasecmp(elem, "H") == 0) goto next_line;
 
+            // mmCIF marks residues with no canonical numbering (often heteroatoms or
+            // waters) with label_seq_id "."; substitute a synthetic, per-chain
+            // sequential number so each one still gets a distinct token below
             if (strcmp(seq_id, ".") == 0) {
                 int dc = 1;
                 for (int i = 0; i < num_chains_tracked; i++) {
@@ -559,14 +691,17 @@ ParsedStruct parse_structure(const char *str_file) {
                     dot_counters[num_chains_tracked].count = 1;
                     num_chains_tracked++;
                 }
-                if ((size_t)snprintf(seq_id, sizeof(seq_id), "%d", dc) >= sizeof(seq_id)) continue;
+                if ((size_t)snprintf(seq_id, sizeof(seq_id), "%d", dc) >= sizeof(seq_id)) goto next_line;
             }
 
             double mass = get_mass(elem);
+            // token uniquely identifies a residue across the whole structure; it is
+            // the key used by both the fast-path check and the hash table below
             char token[MAX_CHAIN_LEN + MAX_SEQ_LEN + 1];
-            if ((size_t)snprintf(token, sizeof(token), "%s_%s", chain, seq_id) >= sizeof(token)) continue;
+            if ((size_t)snprintf(token, sizeof(token), "%s_%s", chain, seq_id) >= sizeof(token)) goto next_line;
 
-            // register chain globally
+            // register chain globally; linear scan is fine since the number of
+            // distinct chains stays small
             int cid = -1;
             for (int i = 0; i < num_uchains; i++) {
                 if (strcmp(uchains[i], chain) == 0) {
@@ -584,73 +719,103 @@ ParsedStruct parse_structure(const char *str_file) {
                 cid = num_uchains++;
             }
 
-            // check the last entry before falling through to the hash table
+            // check the last entry before falling through to the hash table;
+            // atoms of one residue are almost always contiguous in the file, so this
+            // fast path resolves the vast majority of atoms without a hash lookup
             int ri = -1;
-            if (count > 0 && strcmp(res_arr[count - 1].token, token) == 0) {
+            if (count > 0 && strcmp(meta[count - 1].token, token) == 0) {
                 ri = count - 1;
             } else {
-                ri = rhash_get(rhash, res_arr, token);
+                ri = rhash_get(rhash, meta, token);
             }
 
             if (ri == -1) {
-                // fail before allocating downstream matrices
+                // guard before any allocation so the error fires before leaving a
+                // partially-constructed state that would complicate cleanup
                 if (count >= MAX_TOKENS) {
-                    fclose(f);
+                    free(buffer);
+                    free(meta); free(res_x); free(res_y); free(res_z); free(mass_sum);
                     free(dot_counters);
                     rhash_free(rhash);
-                    free(res_arr);
                     free(uchains);
+                    free(atoms);
                     fprintf(stderr, "Structure exceeds %d residues.\n", MAX_TOKENS);
                     fail("Structure too large.");
                 }
 
+                // resize all parallel SoA arrays together so they always stay the
+                // same length; a failure on any one is caught before the others change
                 if (count >= cap) {
                     cap *= 2;
-                    Residue *tmp = realloc(res_arr, cap * sizeof(Residue));
-                    if (!tmp) fail("OOM structure array.");
-                    res_arr = tmp;
+                    ResidueMeta *tm  = realloc(meta,     cap * sizeof(ResidueMeta));
+                    double      *tx  = realloc(res_x,    cap * sizeof(double));
+                    double      *ty  = realloc(res_y,    cap * sizeof(double));
+                    double      *tz  = realloc(res_z,    cap * sizeof(double));
+                    double      *tms = realloc(mass_sum, cap * sizeof(double));
+                    if (!tm || !tx || !ty || !tz || !tms) fail("OOM structure arrays.");
+                    meta = tm; res_x = tx; res_y = ty; res_z = tz; mass_sum = tms;
                 }
-                snprintf(res_arr[count].chain, sizeof(res_arr[count].chain), "%s", chain);
-                snprintf(res_arr[count].seq_id, sizeof(res_arr[count].seq_id), "%s", seq_id);
-                snprintf(res_arr[count].token, sizeof(res_arr[count].token), "%s", token);
-                res_arr[count].chain_id = cid;
-                res_arr[count].x = 0;
-                res_arr[count].y = 0;
-                res_arr[count].z = 0;
-                res_arr[count].mass_sum = 0;
+
+                snprintf(meta[count].chain,  sizeof(meta[count].chain),  "%s", chain);
+                snprintf(meta[count].seq_id, sizeof(meta[count].seq_id), "%s", seq_id);
+                snprintf(meta[count].token,  sizeof(meta[count].token),  "%s", token);
+                meta[count].chain_id = cid;
+
+                res_x[count]    = 0.0;
+                res_y[count]    = 0.0;
+                res_z[count]    = 0.0;
+                mass_sum[count] = 0.0;
                 ri = count;
 
-                rhash_insert(rhash, res_arr, ri);
+                rhash_insert(rhash, meta, ri);
                 count++;
             }
 
-            res_arr[ri].x += x * mass;
-            res_arr[ri].y += y * mass;
-            res_arr[ri].z += z * mass;
-            res_arr[ri].mass_sum += mass;
+            // accumulate mass-weighted sums; divided by mass_sum once parsing is
+            // complete (see below) to get each residue's final centroid coordinate
+            res_x[ri] += x * mass;
+            res_y[ri] += y * mass;
+            res_z[ri] += z * mass;
+            mass_sum[ri] += mass;
+
+            if (at_cnt >= at_cap) {
+                at_cap *= 2;
+                RawAtom *tmp = realloc(atoms, at_cap * sizeof(RawAtom));
+                if (!tmp) fail("OOM atoms array.");
+                atoms = tmp;
+            }
+            atoms[at_cnt++] = (RawAtom){ ri, x, y, z };
         }
+
+next_line:
+        // advance the read pointer to the character after the '\n' that was nulled
+        // above; if no '\n' was found we have consumed the last (unterminated) line
+        if (line_end) ptr = line_end + 1;
+        else break;
     }
-    fclose(f);
+
+    free(buffer);
     free(dot_counters);
     rhash_free(rhash);
 
+    // crude sanity check to catch a wrong/non-structure file being passed in, rather
+    // than silently proceeding with a near-empty structure
     if (count < 10) fail("non-structure file or insufficient ATOM records.");
 
-    // precompute COM to spare nested loop divisions
+    // divide accumulated mass-weighted sums by total mass to get each residue's
+    // centroid; a residue with mass_sum == 0 (e.g. all-hydrogen) is left at the
+    // origin rather than flagged — worth inspecting if contacts look wrong
     for (int i = 0; i < count; i++) {
-        if (res_arr[i].mass_sum > 0) {
-            res_arr[i].x /= res_arr[i].mass_sum;
-            res_arr[i].y /= res_arr[i].mass_sum;
-            res_arr[i].z /= res_arr[i].mass_sum;
+        if (mass_sum[i] > 0.0) {
+            res_x[i] /= mass_sum[i];
+            res_y[i] /= mass_sum[i];
+            res_z[i] /= mass_sum[i];
         }
     }
+    // internal accumulator no longer needed after centroid coords are finalized
+    free(mass_sum);
 
-    ParsedStruct ps = {
-        res_arr,
-        count,
-        uchains,
-        num_uchains
-    };
+    ParsedStruct ps = { meta, res_x, res_y, res_z, count, uchains, num_uchains, atoms, at_cnt };
     return ps;
 }
 
@@ -658,6 +823,9 @@ ParsedStruct parse_structure(const char *str_file) {
 /* Main program                                                               */
 /* -------------------------------------------------------------------------- */
 
+// CLI entry point: validates inputs, computes per-residue distances and PAE-derived
+// contact probabilities, aggregates them into a Pinc score per chain pair, and writes
+// the default CSV plus any of the optional --all / --pairlist outputs
 int main(int argc, char **argv) {
     if (argc < 3) {
         printf("Description:\n"
@@ -683,11 +851,13 @@ int main(int argc, char **argv) {
     bool opt_pairlist = false;
     char results_dir[512] = ".";
 
-    // validate extensions
+    // access() with F_OK only checks existence, not readability; a permissions
+    // problem will instead surface later as a fopen() failure inside the parsers
     if (!has_extension(jsn_file, "json", NULL)) fail("JSON file must have .json extension.");
     if (!has_extension(str_file, "pdb", "cif")) fail("structure file must have .pdb/.cif extension.");
     if (access(jsn_file, F_OK) != 0 || access(str_file, F_OK) != 0) fail("input file(s) not found.");
 
+    // unrecognized arguments are silently ignored rather than rejected
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--all") == 0) opt_all = true;
         else if (strcmp(argv[i], "--pairlist") == 0) opt_pairlist = true;
@@ -701,12 +871,15 @@ int main(int argc, char **argv) {
 
     if (access(results_dir, W_OK) != 0) fail("results directory does not exist or is not writable.");
 
+    // strip trailing slash(es) so the path joins below never produce a double slash
     size_t rlen = strlen(results_dir);
     while (rlen > 0 && (results_dir[rlen - 1] == '/' || results_dir[rlen - 1] == '\\')) {
         results_dir[rlen - 1] = '\0';
         rlen--;
     }
 
+    // derive a bare stem from the structure filename (drop directory and extension)
+    // so all output files share one consistent base name under results_dir
     const char *base_name = str_file;
     for (const char *p = str_file; *p; p++) {
         if (*p == '/' || *p == '\\') base_name = p + 1;
@@ -725,65 +898,59 @@ int main(int argc, char **argv) {
     double *pae_mat = parse_pae_json(jsn_file, &n_pae);
 
     ParsedStruct ps = parse_structure(str_file);
-    int n_res = ps.res_count;
-    Residue *res = ps.res_arr;
+    int n_res       = ps.res_count;
+    ResidueMeta *meta = ps.meta;
+    double *res_x   = ps.x;
+    double *res_y   = ps.y;
+    double *res_z   = ps.z;
     int num_uchains = ps.num_uchains;
     ChainName *uchains = ps.uchains;
+    RawAtom *atoms  = ps.atoms;
 
+    // the single most important correctness check in the program: everything below
+    // assumes pae_mat row/column i and meta[i] refer to the same i-th residue, in the
+    // same order, so an undetected size mismatch here would silently corrupt every score
     if (n_pae != n_res) {
         fprintf(stderr, "Dim mismatch. PAE: %dx%d. Struct: %dx%d.\n", n_pae, n_pae, n_res, n_res);
         fail("Check that structure and PAE correspond to the same model.");
     }
 
-    // allocate packed symmetric upper-triangular matrices
+    // allocate the single packed symmetric upper-triangular contact matrix;
+    // dist_mat is intentionally omitted: storing it would cost O(n^2/2) doubles and
+    // profiling showed the resulting cache pressure outweighed the savings from
+    // avoiding distance recomputation in the downstream chain-pair and pairlist loops,
+    // which only execute for the small in-contact fraction of pairs anyway
     size_t sym_size = ((size_t)n_res * (size_t)(n_res + 1)) / 2;
-    double *dist_mat = malloc(sym_size * sizeof(double));
     double *cont_sym = malloc(sym_size * sizeof(double));
-    if (!dist_mat || !cont_sym) fail("Symmetric matrix allocation failed.");
+    if (!cont_sym) fail("Symmetric matrix allocation failed.");
 
-    // compute distances and symmetric contact probabilities
+    // compute symmetric contact probabilities for all residue pairs;
+    // SoA coordinate arrays (res_x/y/z) keep cache lines dense for this hot loop
     for (size_t i = 0; i < (size_t)n_res; i++) {
-        size_t diag_idx = PACKED_IDX(i, i, n_res);
-        dist_mat[diag_idx] = 0.0;
-        cont_sym[diag_idx] = 1.0;
+        cont_sym[PACKED_IDX(i, i, n_res)] = 1.0;
 
         for (size_t j = i + 1; j < (size_t)n_res; j++) {
-            double dx = res[i].x - res[j].x;
-            double dy = res[i].y - res[j].y;
-            double dz = res[i].z - res[j].z;
-            double d = sqrt(dx * dx + dy * dy + dz * dz);
-            
+            double dx = res_x[i] - res_x[j];
+            double dy = res_y[i] - res_y[j];
+            double dz = res_z[i] - res_z[j];
+            double d  = sqrt(dx * dx + dy * dy + dz * dz);
+
             size_t p_idx = PACKED_IDX(i, j, n_res);
-            dist_mat[p_idx] = d;
 
-            double pae_ij = pae_mat[i * n_res + j];
-            double p_ij = 0.0;
-            if (pae_ij > 0) {
-                double v_int = vol_intersect(pae_ij, d);
-                double v_unc = vol_sphere(pae_ij);
-                p_ij = (v_unc > 0) ? (v_int / v_unc) : 0.0;
-                if (!isfinite(p_ij)) p_ij = 0.0;
-                if (p_ij > 1.0) p_ij = 1.0;
-            }
-
-            double pae_ji = pae_mat[j * n_res + i];
-            double p_ji = 0.0;
-            if (pae_ji > 0) {
-                double v_int = vol_intersect(pae_ji, d);
-                double v_unc = vol_sphere(pae_ji);
-                p_ji = (v_unc > 0) ? (v_int / v_unc) : 0.0;
-                if (!isfinite(p_ji)) p_ji = 0.0;
-                if (p_ji > 1.0) p_ji = 1.0;
-            }
-
+            // the PAE matrix is NOT symmetric (pae[i][j] is the error in j's position
+            // when aligned on i, and vice versa), so both directions are evaluated
+            // separately and only averaged into cont_sym at the end
+            double p_ij = contact_prob(pae_mat[i * n_res + j], d);
+            double p_ji = contact_prob(pae_mat[j * n_res + i], d);
             cont_sym[p_idx] = (p_ij + p_ji) / 2.0;
         }
     }
 
     // chain index: single flat array with offset/count per chain
-    ChainResIndex ci = build_chain_index(res, n_res, num_uchains);
+    ChainResIndex ci = build_chain_index(meta, n_res, num_uchains);
 
     size_t total_pairs = ((size_t)num_uchains * ((size_t)num_uchains - 1)) / 2;
+    // every field defaults to zero even for a pair with no in-range contacts
     ChainPair *cpairs = calloc(total_pairs, sizeof(ChainPair));
     if (!cpairs && total_pairs > 0) fail("OOM chain pairs.");
 
@@ -794,72 +961,76 @@ int main(int argc, char **argv) {
             snprintf(cpairs[cp_idx].chain1, sizeof(cpairs[cp_idx].chain1), "%s", uchains[i]);
             snprintf(cpairs[cp_idx].chain2, sizeof(cpairs[cp_idx].chain2), "%s", uchains[j]);
 
-            double sum = 0.0;
-            int count = 0;
+            double sum1 = 0.0, sum2 = 0.0;
+            int cnt = 0;
 
-            // iterate strictly over matching inter-chain indices
             for (int u = 0; u < ci.counts[i]; u++) {
                 int ri = ci.flat[ci.offsets[i] + u];
                 for (int v = 0; v < ci.counts[j]; v++) {
                     int rj = ci.flat[ci.offsets[j] + v];
-                    
-                    size_t s_idx = SYM_IDX(ri, rj, n_res);
-                    if (dist_mat[s_idx] < CONTACT_RADIUS) {
-                        sum += cont_sym[s_idx];
-                        count++;
+
+                    double dx = res_x[ri] - res_x[rj];
+                    double dy = res_y[ri] - res_y[rj];
+                    double dz = res_z[ri] - res_z[rj];
+                    double d  = sqrt(dx * dx + dy * dy + dz * dz);
+
+                    if (isfinite(d) && d < CONTACT_RADIUS) {
+                        // ri belongs to chain i (aligned), rj belongs to chain j (scored)
+                        // Pinc1 = chain i residues are scored → use pae[rj][ri]
+                        // Pinc2 = chain j residues are scored → use pae[ri][rj]
+                        sum1 += contact_prob(pae_mat[(size_t)rj * n_res + ri], d);
+                        sum2 += contact_prob(pae_mat[(size_t)ri * n_res + rj], d);
+
+                        cnt++;
                     }
                 }
             }
-            cpairs[cp_idx].pinc_score = (count > 0) ? (sum / count) : 0.0;
+            // pinc1/pinc2: mean contact probability over this chain pair's contacts,
+            // viewed from each chain's own PAE column; pinc_score: their symmetric average
+            cpairs[cp_idx].pinc1      = (cnt > 0) ? (sum1 / cnt) : 0.0;
+            cpairs[cp_idx].pinc2      = (cnt > 0) ? (sum2 / cnt) : 0.0;
+            cpairs[cp_idx].pinc_score = (cnt > 0) ? ((sum1 + sum2) / (2.0 * cnt)) : 0.0;
+            cpairs[cp_idx].order      = (int)cp_idx;
             cp_idx++;
         }
     }
 
+    // highest-scoring chain pairs first (see cmp_chainpair)
     qsort(cpairs, total_pairs, sizeof(ChainPair), cmp_chainpair);
 
-    // output default
+    // default Pinc.csv output
     char pinc_csv[1024];
     if ((size_t)snprintf(pinc_csv, sizeof(pinc_csv), "%s_Pinc.csv", out_path) >= sizeof(pinc_csv)) fail("Path long.");
 
     FILE *fp = fopen(pinc_csv, "w");
     if (fp) {
-        fprintf(fp, "chain1,chain2,Pinc\n");
+        fprintf(fp, "chain1,chain2,Pinc1,Pinc2,Pinc\n");
         for (size_t i = 0; i < total_pairs; i++) {
-            fprintf(fp, "%s,%s,%.4f\n", cpairs[i].chain1, cpairs[i].chain2, cpairs[i].pinc_score);
+            fprintf(fp, "%s,%s,%.4f,%.4f,%.4f\n",
+                    cpairs[i].chain1, cpairs[i].chain2,
+                    cpairs[i].pinc1, cpairs[i].pinc2, cpairs[i].pinc_score);
         }
         fclose(fp);
     } else fprintf(stderr, "warning: could not write %s\n", pinc_csv);
 
     // optional --all output
     if (opt_all) {
+        // unlike cont_sym this is the full unpacked, asymmetric n_res x n_res matrix
+        // (memory cost O(n^2) rather than O(n^2/2)), since --all exposes both directions;
+        // distances are recomputed here rather than read from a stored dist_mat
         double *cont_asym = malloc((size_t)n_res * (size_t)n_res * sizeof(double));
         if (!cont_asym) fail("Full contact matrix allocation failed.");
 
         for (size_t i = 0; i < (size_t)n_res; i++) {
             cont_asym[i * n_res + i] = 1.0;
             for (size_t j = i + 1; j < (size_t)n_res; j++) {
-                double d = dist_mat[PACKED_IDX(i, j, n_res)];
-
-                double pae_ij = pae_mat[i * n_res + j];
-                double p_ij = 0.0;
-                if (pae_ij > 0) {
-                    double v_int = vol_intersect(pae_ij, d);
-                    double v_unc = vol_sphere(pae_ij);
-                    p_ij = (v_unc > 0) ? (v_int / v_unc) : 0.0;
-                    if (!isfinite(p_ij)) p_ij = 0.0;
-                    if (p_ij > 1.0) p_ij = 1.0;
-                }
+                double dx = res_x[i] - res_x[j];
+                double dy = res_y[i] - res_y[j];
+                double dz = res_z[i] - res_z[j];
+                double d    = sqrt(dx * dx + dy * dy + dz * dz);
+                double p_ij = contact_prob(pae_mat[i * n_res + j], d);
+                double p_ji = contact_prob(pae_mat[j * n_res + i], d);
                 cont_asym[i * n_res + j] = p_ij;
-
-                double pae_ji = pae_mat[j * n_res + i];
-                double p_ji = 0.0;
-                if (pae_ji > 0) {
-                    double v_int = vol_intersect(pae_ji, d);
-                    double v_unc = vol_sphere(pae_ji);
-                    p_ji = (v_unc > 0) ? (v_int / v_unc) : 0.0;
-                    if (!isfinite(p_ji)) p_ji = 0.0;
-                    if (p_ji > 1.0) p_ji = 1.0;
-                }
                 cont_asym[j * n_res + i] = p_ji;
             }
         }
@@ -868,11 +1039,13 @@ int main(int argc, char **argv) {
         if ((size_t)snprintf(jsn_out, sizeof(jsn_out), "%s_contact_probability.json", out_path) >= sizeof(jsn_out))
             fail("JSON output path too long.");
 
+        // written by hand with fprintf rather than a library, mirroring the
+        // hand-rolled scanning in parse_pae_json(); not minified but valid JSON
         FILE *fj = fopen(jsn_out, "w");
         if (fj) {
             fprintf(fj, "{\n  \"token_chain_ids\":[\n");
             for (int i = 0; i < n_res; i++) {
-                fprintf(fj, "    \"%s\"%s\n", res[i].chain, (i < n_res - 1) ? "," : "");
+                fprintf(fj, "    \"%s\"%s\n", meta[i].chain, (i < n_res - 1) ? "," : "");
             }
             fprintf(fj, "  ],\n  \"contact_probability\":[\n");
             for (int i = 0; i < n_res; i++) {
@@ -890,9 +1063,11 @@ int main(int argc, char **argv) {
     }
 
     // optional --pairlist output
+    // reuses cont_sym computed in the main loop; distance is recomputed on demand
+    // for the small fraction of pairs with non-zero contact probability
     if (opt_pairlist) {
-        int cap = 1000, pcnt = 0;
-        TokenPair *tpairs = malloc(cap * sizeof(TokenPair));
+        int pl_cap = 1000, pcnt = 0;
+        TokenPair *tpairs = malloc(pl_cap * sizeof(TokenPair));
         if (!tpairs) fail("OOM pairlist.");
 
         for (int ca = 0; ca < num_uchains; ca++) {
@@ -907,21 +1082,30 @@ int main(int argc, char **argv) {
                         int lo = (ri < rj) ? ri : rj;
                         int hi = (ri < rj) ? rj : ri;
 
+                        // reuse already-averaged cont_sym; distance is recomputed below
+                        // so the pair can be filtered the same way the R reference does:
+                        // keep iff it is a non-zero contact AND within CONTACT_RADIUS
                         size_t p_idx = PACKED_IDX(lo, hi, n_res);
                         double cp = cont_sym[p_idx];
-                        double dd = dist_mat[p_idx];
 
-                        if (cp > 0 && dd < CONTACT_RADIUS) {
-                            if (pcnt >= cap) {
-                                cap *= 2;
-                                TokenPair *tmp = realloc(tpairs, cap * sizeof(TokenPair));
+                        double dx = res_x[lo] - res_x[hi];
+                        double dy = res_y[lo] - res_y[hi];
+                        double dz = res_z[lo] - res_z[hi];
+                        double dd = sqrt(dx * dx + dy * dy + dz * dz);
+
+                        if (cp > 0.0 && dd < CONTACT_RADIUS) {
+                            if (pcnt >= pl_cap) {
+                                pl_cap *= 2;
+                                TokenPair *tmp = realloc(tpairs, pl_cap * sizeof(TokenPair));
                                 if (!tmp) fail("OOM pairlist array.");
                                 tpairs = tmp;
                             }
-                            snprintf(tpairs[pcnt].token1, sizeof(tpairs[pcnt].token1), "%s", res[lo].token);
-                            snprintf(tpairs[pcnt].token2, sizeof(tpairs[pcnt].token2), "%s", res[hi].token);
+                            snprintf(tpairs[pcnt].token1, sizeof(tpairs[pcnt].token1), "%s", meta[lo].token);
+                            snprintf(tpairs[pcnt].token2, sizeof(tpairs[pcnt].token2), "%s", meta[hi].token);
                             tpairs[pcnt].contact_p = cp;
-                            tpairs[pcnt].distance = dd;
+                            tpairs[pcnt].distance  = dd;
+                            tpairs[pcnt].lo        = lo;
+                            tpairs[pcnt].hi        = hi;
                             pcnt++;
                         }
                     }
@@ -929,6 +1113,7 @@ int main(int argc, char **argv) {
             }
         }
 
+        // highest contact probability first (see cmp_tokenpair)
         qsort(tpairs, pcnt, sizeof(TokenPair), cmp_tokenpair);
 
         char pair_csv[1024];
@@ -938,7 +1123,9 @@ int main(int argc, char **argv) {
         if (ft) {
             fprintf(ft, "token1,token2,contact_p,distance\n");
             for (int i = 0; i < pcnt; i++) {
-                fprintf(ft, "%s,%s,%.4f,%.4f\n", tpairs[i].token1, tpairs[i].token2, tpairs[i].contact_p, tpairs[i].distance);
+                fprintf(ft, "%s,%s,%.4f,%.4f\n",
+                        tpairs[i].token1, tpairs[i].token2,
+                        tpairs[i].contact_p, tpairs[i].distance);
             }
             fclose(ft);
         }
@@ -947,10 +1134,13 @@ int main(int argc, char **argv) {
 
     // cleanup
     free_chain_index(&ci);
-    free(res);
+    free(meta);
+    free(res_x);
+    free(res_y);
+    free(res_z);
     free(uchains);
+    free(atoms);
     free(pae_mat);
-    free(dist_mat);
     free(cont_sym);
     free(cpairs);
 
