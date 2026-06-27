@@ -1,8 +1,11 @@
 # Pinc <a href='https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb'><img src='hexlogo.png' align="right" height="198" /></a>: a simple probabilistic AlphaFold interaction score
 
 <!-- badges: start -->
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb)
+![mirror](https://img.shields.io/badge/status-gitlab%20mirror-blue)
 <!-- badges: end -->
+
+____
+This repository is a read-only mirror of the primary repository on GitLab: https://git.mpi-cbg.de/tothpetroczylab/Pinc
 
 ## Description
 Pinc (**P**robability of **i**nterface **n**ative **c**ontacts) is a simple interaction confidence metric derived from an AlphaFold model and its predicted aligned error (PAE) matrix.
@@ -11,6 +14,9 @@ The method can be used on both AlphaFold2 and AlphaFold3 (including server) outp
 
 
 ## Using the Colab notebook
+<!-- badges: start -->
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb)
+<!-- badges: end -->
 - [ ] Open the interactive Colab notebook [here](https://colab.research.google.com/gist/badonyi/4c976a79efbae4b64ad99d968eedd417/pinc.ipynb) or click "Open in Colab" above
 - [ ] Run the first cell (▶) to enable file upload
 - [ ] Upload a structure file (PDB/mmCIF) its matching PAE matrix (JSON)
